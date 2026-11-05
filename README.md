@@ -1,482 +1,346 @@
-# pixal3d.cpp
+# pixal3d.cpp on an AMD GPU (Linux)
 
-A standalone, **GGML-based C++** implementation of image→3D: background removal, image
-conditioning, the three flow transformers, the VAE decoders, mesh extraction and UV-textured GLB
-export — all in native C++/GGML with no Python at runtime. It runs two model families through one
-pipeline: Microsoft's [TRELLIS.2-4B](https://huggingface.co/microsoft/TRELLIS.2-4B) from a single
-image, and the multiview, camera-aware [TencentARC Pixal3D](https://github.com/TencentARC/Pixal3D)
-backbone that turns four views of an object plus their camera poses into one asset. It can also be
-driven end-to-end from a text prompt, with
-[stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) producing the input image.
+Turn images into textured 3D models (GLB files) on your own GPU, with no Python at runtime.
+This is a fork of [raven38/pixal3d.cpp](https://github.com/raven38/pixal3d.cpp), which builds on
+[pwilkin/trellis.cpp](https://github.com/pwilkin/trellis.cpp) (MIT). It runs two model families:
 
-> **This repository is a fork of [pwilkin/trellis.cpp](https://github.com/pwilkin/trellis.cpp)**
-> (MIT, © 2026 Piotr Wilkin), extending it with the Pixal3D backbone and a WebGPU/WASM browser
-> target. The inherited TRELLIS.2 pipeline described below is upstream's work, ported from the
-> reference implementation at [microsoft/TRELLIS.2](https://github.com/microsoft/TRELLIS.2); see
-> [`NOTICE`](NOTICE) for full attribution and [`PIXAL3D.md`](PIXAL3D.md) for what this fork adds.
+- **TRELLIS.2** (Microsoft): one photo or picture in, 3D model out. Background removal is built in.
+- **Pixal3D** (TencentARC): camera-aware reconstruction from either one cut-out image
+  (single view) or four views of the same object (multiview).
 
-```
-./build/trellis-cli assets/goblin.png out/goblin.glb            # one image    -> UV-textured GLB (atlas + PBR)
-./build/trellis-cli --views views/ --models pixal3d_models \
-                    out/asset.glb                               # 4 views + poses -> one GLB (Pixal3D)
-python tools/render_glb.py out/goblin.glb out/view.png          # quick multi-view render
-```
+This README is a short, tested path from a fresh clone to a GLB on an AMD card. The original
+project README is kept as [`README.upstream.md`](README.upstream.md). It covers every flag, the
+HTTP server, the desktop app, the model details and benchmarks.
 
-Prebuilt binaries for Linux, Windows (CUDA, ROCm, Vulkan) and macOS (Metal), plus the Trellis
-Studio desktop app, are published on the [releases page](../../releases). Serves as the
-recommended image→3D backend of
-[image-to-3dlab](https://github.com/Bingeljell/image-to-3dlab).
+**Tested on:** Fedora 43, AMD Radeon RX 7900 XT (20 GB, `gfx1100`), ROCm 6.4 from the Fedora
+repos, Mesa 25.3.6 (RADV), November 2026.
 
-## Quick start
+> **Build with ROCm, not Vulkan.** On this card, Vulkan gives broken Pixal3D results while ROCm
+> matches the reference. See [Vulkan problems](#vulkan-problems-on-the-rx-7900-xt).
 
-New here? **Trellis Studio** is a one-command install that auto-detects your GPU
-runtime (CUDA / ROCm / Vulkan), downloads the server + weights, and gives you a
-drag-an-image → 3D desktop app with an interactive preview and a saved gallery.
+## 1. Install the build tools
 
-```bash
-# Linux (x86-64)
-curl -fsSL https://raw.githubusercontent.com/raven38/pixal3d.cpp/main/install/install.sh | bash
-```
-```powershell
-# Windows (x64), in PowerShell
-irm https://raw.githubusercontent.com/raven38/pixal3d.cpp/main/install/install.ps1 | iex
+```sh
+# needed for every build
+sudo dnf install git cmake ninja-build gcc-c++
+# ROCm build (recommended)
+sudo dnf install rocm-hip-devel hipblas-devel rocblas-devel rocminfo
+# Vulkan build (optional)
+sudo dnf install vulkan-headers vulkan-loader-devel glslc glslang spirv-headers-devel
+# Hugging Face CLI ("hf"), for the model downloads
+pip install --user -U huggingface_hub
 ```
 
-See [**Trellis Studio (desktop app)**](#trellis-studio-desktop-app) below for what it
-does and how to use it, or [`docs/getting-started.md`](docs/getting-started.md) for the
-full walkthrough and installer options.
+ROCm needs your user in the `render` and `video` groups. Check with `id -nG`. If either is
+missing, run `sudo usermod -aG render,video $USER` and log in again.
 
-## Showcase
+## 2. Get the source
 
-Seven single-image→3D reconstructions produced end-to-end by pixal3d.cpp
-(commit `ec464fe`, CUDA) on a single RTX 4090 with the published single-view
-Pixal3D model set `pixal3d-sv-q8_0 v1` — BiRefNet matte → MoGe-2 FOV estimate →
-`--views … --pixal3d-weights sv` (all res-1024 cascade, seed 42, Pixal3D's
-default ~1M-face / 4096² atlas postprocess; the per-asset numbers are in
-[`assets/showcase/`](assets/showcase/), and the Draco-compressed GLBs plus their
-Z-Image-Turbo source images are attached to the
-[`showcase-assets-sv-1` release](https://github.com/raven38/pixal3d.cpp/releases/tag/showcase-assets-sv-1) rather than committed, to keep clones small):
+```sh
+git clone <this repo> pixal3d.cpp
+cd pixal3d.cpp
+git submodule update --init --recursive
+```
 
-<p>
-<a href="assets/showcase/axe/axe_quad4k.webp"><img src="assets/showcase/axe/axe_quad4k.webp" width="49%"></a>
-<a href="assets/showcase/chest/chest_quad4k.webp"><img src="assets/showcase/chest/chest_quad4k.webp" width="49%"></a>
-<a href="assets/showcase/cottage/cottage_quad4k.webp"><img src="assets/showcase/cottage/cottage_quad4k.webp" width="49%"></a>
-<a href="assets/showcase/drone/drone_quad4k.webp"><img src="assets/showcase/drone/drone_quad4k.webp" width="49%"></a>
-<a href="assets/showcase/golem/golem_quad4k.webp"><img src="assets/showcase/golem/golem_quad4k.webp" width="49%"></a>
-<a href="assets/showcase/knight/knight_quad4k.webp"><img src="assets/showcase/knight/knight_quad4k.webp" width="49%"></a>
-<a href="assets/showcase/racer/racer_quad4k.webp"><img src="assets/showcase/racer/racer_quad4k.webp" width="49%"></a>
-</p>
+The first configure step downloads libwebp, so it needs network access.
 
-Each grid is a 4096×4096 four-view capture — `<model-viewer>` orbits 0° / 90° /
-180° / 270° at 75° elevation, 2048² per view (in Pixal3D's reference frame the
-view matching the source image is the 180° tile, bottom-left) — made with the
-[`tools/mv_preview/render_quad.js`](tools/mv_preview/render_quad.js) recipe, a
-headless Playwright driver around Google's `<model-viewer>`: one navigation per
-view, wait for auto-framing to settle, capture via `toBlob`, and
-[`stitch_quad.py`](tools/mv_preview/stitch_quad.py) assembles the final grid.
+## 3. Build
 
-## Trellis Studio (desktop app)
+### ROCm (recommended)
 
-**Trellis Studio** is the standalone desktop app (built with [Tauri](https://tauri.app))
-for anyone who wants image→3D without touching the command line. The one-command
-installer above auto-detects your GPU runtime, downloads the matching
-`trellis-server` build plus the ~16.5 GB of weights, and installs the app; on launch
-it starts and supervises the server for you, so the whole flow is drag-image →
-click → rotate the result.
+```sh
+ROCM_LLVM=$(hipconfig -l)          # /usr/lib64/rocm/llvm/bin on Fedora
+HIPCXX=$ROCM_LLVM/clang++ HIP_PATH=$(hipconfig -R) \
+cmake -S . -B build-rocm -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_HIP=ON -DGGML_HIP_GRAPHS=OFF -DGPU_TARGETS=gfx1100 \
+    -DCMAKE_C_COMPILER=$ROCM_LLVM/clang \
+    -DCMAKE_CXX_COMPILER=$ROCM_LLVM/clang++ \
+    -DCMAKE_HIP_COMPILER=$ROCM_LLVM/clang++ \
+    -DCMAKE_PREFIX_PATH=$(hipconfig -R)
+cmake --build build-rocm -j --target trellis-cli
+```
 
-<p align="center">
-<img src="assets/trellis-studio.png" width="92%" alt="Trellis Studio — drop an image, generate a textured 3D model, preview it interactively">
-</p>
+- `gfx1100` is the RX 7900 XTX / XT / GRE. For another card, `rocminfo | grep gfx` shows the
+  right target.
+- `-DGGML_HIP_GRAPHS=OFF` matches the project's own release build. HIP graph capture stalls on
+  these graphs.
+- `--target trellis-cli` builds only the command-line tool. Leave it out to also build
+  `trellis-server` and the tests.
 
-**Using it:**
+### Vulkan (optional)
 
-1. **Add an image** — drag-and-drop onto the drop zone, click to browse, or paste
-   from the clipboard.
-2. **Set options** (optional) — resolution (512 light / 1024 cascade / 1536 high),
-   seed, background removal (auto / birefnet / threshold), and UV unwrap
-   (xatlas / box). Defaults match the CLI.
-3. **Generate 3D** — this takes a few minutes; a live stage line shows progress.
-4. **Inspect** — rotate and zoom in the interactive preview (Google's three.js-based
-   `<model-viewer>`); **Reset view** re-frames the camera and **Save GLB…** exports
-   the model.
-5. **Reuse** — every result is kept in a local **gallery** (IndexedDB): click a
-   thumbnail to reload its model, input image, and settings — even after restarting
-   the app.
+```sh
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON
+cmake --build build -j --target trellis-cli
+```
 
-The **Settings** panel (gear icon) points the app at a different models directory,
-GPU index, or port; the models directory, backend, and server binary come from the
-`config.json` the installer writes. Because the UI is a plain web bundle you can also
-skip the app entirely and open it in a browser against a `trellis-server` you started
-yourself — see [`docs/getting-started.md`](docs/getting-started.md) for that, the full
-installer options, and troubleshooting. The app source lives in [`app/`](app/).
+On the RX 7900 XT this build is fine for TRELLIS.2 single-image runs but not for Pixal3D. See
+[Vulkan problems](#vulkan-problems-on-the-rx-7900-xt).
 
-The sections below document the **CLI and HTTP server** directly, for advanced and
-scripted use.
+## 4. Download the models
 
-## Usage
+All three model sets go into one folder, `models/q8`, which git ignores. `q8` means 8-bit
+quantized weights, which the project describes as near-lossless. They take about 22 GB in total.
 
-The default is the **1024 cascade** (LR `flow_512` → upsample → HR `flow_1024` →
-res-1024 decode, sharper geometry); `--res 512` selects the lighter res-512 path.
-All behavior is driven by CLI flags — run `trellis-cli --help` for the full list.
-The most useful ones:
+```sh
+# TRELLIS.2, plus the files Pixal3D shares with it (DINOv3, decoders, BiRefNet): ~10 GB
+hf download ilintar/trellis2-gguf --include "q8/*" --local-dir models
+
+# Pixal3D single view: ~5.9 GB
+hf download raven38/pixal3d-sv-q8_0-v1 --include "pixal3d_*" --local-dir models/q8
+
+# Pixal3D multiview: ~5.9 GB
+hf download raven38/pixal3d-q8_0-v1 --include "pixal3d_*" --local-dir models/q8
+```
+
+You only need the Pixal3D sets for the modes you use. With `--include "pixal3d_*"`, only the
+Pixal3D-specific files are downloaded, next to the shared files from the first set. That shared
+folder is fine for the command-line tool. (The desktop app and `trellis-server` expect a separate
+folder per Pixal3D set; see `README.upstream.md`.)
+
+## 5. Generate models
+
+All commands use the ROCm binary and are run from the repo root. Notes:
+
+- `--require-gpu` stops with an error instead of quietly falling back to the very slow CPU path.
+- The default seed is 42. Change it with `--seed N` to get a different result from the same
+  input.
+- Besides the `.glb`, the tool also writes `<name>.ply` (the mesh) and `<name>_base.png` (the
+  colour texture) next to it.
+- To view a result, import it in Blender (File → Import → glTF 2.0) or drop it on
+  <https://gltf-viewer.donmccurdy.com/>.
+
+```sh
+mkdir -p out
+```
+
+### 5.1 TRELLIS.2: one image (no Pixal3D)
+
+```sh
+./build-rocm/trellis-cli assets/goblin.png out/goblin.glb --models models/q8 --require-gpu
+```
+
+- Any PNG or JPG works. The background is removed automatically. One object on a plain
+  background works best.
+- The default resolution is 1024. `--res 512` is faster and lighter, and `--res 1536` is
+  sharper and heavier.
+- The goblin takes about 4 minutes on the RX 7900 XT.
+
+**TRELLIS.2 with several images** (2 to 8 pictures of one object, no camera poses needed):
+
+```sh
+./build-rocm/trellis-cli --trellis2-mv my_photos/ out/obj.glb --models models/q8 --require-gpu
+```
+
+The images are read in natural filename order. This mode uses the normal TRELLIS.2 weights. It
+is separate from Pixal3D multiview: it ignores `transforms.json` and camera data.
+
+### 5.2 Make a cut-out (images without transparency)
+
+Pixal3D does no background removal of its own, so it needs PNGs with a real transparent
+background.
+
+**For single view**, use the built-in BiRefNet matting:
+
+```sh
+./build-rocm/trellis-cli assets/goblin.png out/goblin.glb --models models/q8 --bg-only
+```
+
+This writes `out/goblin_cutout.png` and nothing else. The name comes from the output path you
+give, and no GLB is made. The cut-out is cropped square around the object, which is what
+`--sv-image` wants anyway.
+
+**For multiview, don't use `--bg-only`.** It re-crops every view, so the views no longer match
+their cameras. Use a matting tool that keeps the original canvas instead, for example
+[rembg](https://github.com/danielgatis/rembg):
+
+```sh
+uvx --python 3.12 --from "rembg[cpu,cli]" rembg i front.jpg front.png
+```
+
+The output has the same size as the input, with an alpha channel. On first use, rembg downloads
+its default model, BRIA RMBG-2.0 (about 1 GB, stored in `~/.rembg/`).
+
+### 5.3 Pixal3D: single view
+
+```sh
+./build-rocm/trellis-cli --sv-image out/goblin_cutout.png --models models/q8 --require-gpu out/goblin_sv.glb
+```
+
+- The input must be an RGBA cut-out (see 5.2).
+- The tool crops it like the reference preprocess and picks the single-view weights by itself.
+  It saves the staged `input.png` and `transforms.json` in `out/goblin_sv.svviews/`.
+- If the picture was taken with a wide lens, pass its horizontal field of view in radians with
+  `--fov` (the default is 0.349, i.e. 20°).
+- Pixal3D always runs at 1024 or 1536 (`--res 512` is refused). By default it makes a mesh of
+  about 1M faces with a 4096² texture, so GLBs are 30 to 70 MB. Expect about 2 minutes per
+  model on the RX 7900 XT.
+
+### 5.4 Pixal3D: multiview
+
+Try Pixal3D's own four-view sample first:
+
+```sh
+mkdir -p pixal3d-example
+for f in transforms.json view00_azim000.png view01_azim090.png view02_azim180.png view03_azim270.png; do
+  curl -fL -o pixal3d-example/$f \
+    https://raw.githubusercontent.com/TencentARC/Pixal3D/master/assets/mv_images/example/$f
+done
+./build-rocm/trellis-cli --views pixal3d-example --models models/q8 --require-gpu out/example_mv.glb
+```
+
+On the RX 7900 XT this takes about 5.5 minutes. The output matches the project's reference run;
+see the Vulkan section for the numbers.
+
+**Your own four views** must show one object from the canonical turntable rig: elevation 0°,
+azimuth 0° / 90° / 180° / 270°, 20° field of view, camera distance 3.119. Each view must be:
+
+- an RGBA PNG with a transparent background, matted without re-cropping (see 5.2);
+- at the same scale as the others, with the object centred and about 85 % of the frame height.
+
+The 90° camera sits to the right of the front camera, so it sees the **left** side of a subject
+that faces the front camera. The upstream docs call this view "right".
+
+Then do one of these:
+
+- **With `transforms.json` (recommended):** copy `pixal3d-example/transforms.json` into your
+  folder and change each `file_path` to your own image, keeping the order front, 90°, back,
+  270°.
+- **Without `transforms.json`:** put exactly four images in the folder and pass
+  `--mesh-scale 1.0`. They are taken in natural filename order as front, 90°, back, 270°, so
+  name them to sort that way, for example `0_front.png`, `1_left.png`, `2_back.png`,
+  `3_right.png`.
+
+```sh
+./build-rocm/trellis-cli --views my_views/ --models models/q8 --require-gpu out/my_mv.glb
+```
+
+**Check the result against the inputs** instead of eyeballing it. This script projects the mesh
+through the input cameras and compares silhouettes. It needs numpy and pillow, and part of its
+output text is in Japanese.
+
+```sh
+python3 tools/silhouette_iou.py out/my_mv.glb my_views/ --res=256
+```
+
+Write `--res=256` with `=`; `--res 256` crashes. A mean IoU around 0.98 is what the sample
+gets, and a broken run scores around 0.2. Character turnarounds often score lower on the two
+side views; `README.upstream.md` ("Known multiview failure modes") explains why.
+
+### Useful flags
 
 | flag | effect |
-|------|--------|
-| `--res 512\|1024\|1536` | geometry resolution (512 = light path, no cascade) |
-| `--bg-removal threshold\|birefnet` | default **auto**: pre-matted images keep their alpha, otherwise the BiRefNet matte (~13s on GPU). The plain white-bg keyer cuts specular highlights out of the alpha — the flow then generates holes there — so it is opt-in only |
+|---|---|
+| `--seed N` | different random seed, so a different result (default 42) |
+| `--res 512\|1024\|1536` | geometry resolution (512 works only for TRELLIS.2) |
 | `--no-texture` | geometry only |
-| `--decim GRID` | legacy cluster-grid decimation (default: quadric simplify to 300K faces @1024 / 150K @512; `0` = keep the full-res mesh) |
-| `--atlas PX` | UV atlas size (default 2048 @1024 / 1024 @512) |
-| `--box-uv` | voxel-native 6-way box projection instead of the default xatlas unwrap (O(faces), faster, looser packing) |
-| `--seed N` | RNG seed |
-| `--trellis2-mv DIR` | TRELLIS.2 pose-free multi-image input (2–8 images, natural filename order); separate from Pixal3D `--views` |
-| `--trellis2-mv-mode stochastic\|multidiffusion` | multi-image FlowEuler fusion policy (default `stochastic`) |
-| `--require-gpu` | fail instead of falling back to the (very slow, RAM-hungry) CPU path |
-| `--profile` | after the second forward of every flow DiT, re-submit the same graph as role×block slices and as single nodes and print the breakdown (`[prof]` lines: by role / by block / by op / top nodes, plus the slice-sum vs whole-forward ratios). Timing only — the sampler still uses the whole-graph output. Adds roughly 4 forwards per flow |
-| `--profile-cond` | print per-view / per-stage wall-clock laps of the conditioning (DINOv3 → NAF → projection, host and device paths) and of the sparse decoders / cascade upsample (`[cond-v]` lines). printf only — adds no compute, unlike `--profile`, so it can be used to time the conditioning without the flow side-passes heating the GPU first. The coarse per-stage `[cond]` laps are printed always, in the multiview pipeline (`--views`) only |
-| `--naf-native-gn` | Metal only: run the NAF encoder's GroupNorm as ggml's native `GROUP_NORM` op instead of the default `ggml_norm` re-expression. The native Metal kernel is one 32-thread threadgroup per group (453 ms/op, ≈+3.5 s per view per conditioning stage) and further from a float64 reference; the flag exists for A/B (`--no-fa`-style), not for production |
+| `--atlas PX` | texture size |
+| `--webp off` | PNG textures instead of WebP (MeshLab can't read WebP GLBs) |
+| `--bg-removal threshold\|birefnet` | force a background-removal method (TRELLIS.2 image input) |
+| `--gpu N` | pick a GPU index (`-1` = CPU) |
 
-The postprocess matches the reference pipeline op for op (see
-`docs/spec/27-reference-postprocess.md` / `28-divergence-matrix.md`): the raw
-dual-grid mesh is welded and hole-filled, **remeshed with narrow-band UDF dual
-contouring** into a single clean manifold, quadric-simplified to the face budget,
-coarse-clustered with the reference's bottom-up normal-cone merge, unwrapped with
-stock xatlas per cluster and packed at auto resolution (UVs normalized to fill the
-full atlas), shaded per texel by trilinear sampling of the voxel PBR volume (with
-BVH closest-point snap onto the original surface), gutter-filled with a Telea
-inpaint port, and exported as a GLB with smooth normals and **lossy-WebP textures**
-(`EXT_texture_webp`; PNG fallback when built with `-DTRELLIS_WEBP=OFF`). Output
-quality is at parity with the reference CUDA postprocess on identical inputs.
+Run `./build-rocm/trellis-cli --help` for the full list.
 
-`TRELLIS_DBG_*` environment variables toggle developer debug logging only; no
-behavior-driving environment variables remain — use the flags above.
+## Vulkan problems on the RX 7900 XT
 
-### trellis-server
+**Summary:** on this card and driver, the Vulkan build produces wrong Pixal3D output. The same
+models are correct on ROCm on the same GPU, and on the CPU backend. Use the ROCm build.
 
-`trellis-server` keeps the process resident (no Vulkan re-init per request) and exposes:
+### What goes wrong
 
-```
-GET  /health     -> "ok"
-POST /generate      TRELLIS.2 single image
-POST /generate-trellis2-mv
-                    TRELLIS.2 pose-free 2..8 image conditioning;
-                    fusion=stochastic|multidiffusion
-POST /generate-mv   Pixal3D camera-aware multiview
-POST /generate-sv   Pixal3D single view
-```
-
-Launch-time flags (including `--res`) set the per-request defaults; each request can
-override them with its own fields.
-
-### TRELLIS.2 multi-image / multiview mode
-
-The native TRELLIS.2 pipeline can condition the existing **single-image TRELLIS.2 weights**
-on 2–8 images without camera poses or additional checkpoints:
-
-```bash
-./build/trellis-cli --trellis2-mv ./views \
-  --trellis2-mv-mode stochastic \
-  --models /path/to/trellis2-gguf --seed 42 --res 1024 out.glb
-```
-
-`./views` is naturally sorted by filename. This mode is deliberately separate from
-Pixal3D `--views`: it does **not** read `transforms.json`, FOV, camera matrices or
-`mesh_scale`.
-
-Two inference-time fusion algorithms are exposed, matching the experimental multi-image
-sampler in Microsoft TRELLIS and the pinned TRELLIS.2 PR #104 reference:
-
-- **`stochastic`** — sampler step `k` uses positive condition `k % V`. Compute is
-  close to the single-image sampler and every stage resets the view cycle.
-- **`multidiffusion`** — every step evaluates the raw positive model prediction for all
-  `V` images, averages those predictions, then applies the single negative prediction /
-  CFG / guidance-rescale. Flow compute therefore scales approximately with the number of
-  input images.
-
-The same policy is used in sparse structure, Shape-SLat LR/HR cascade, and Texture-SLat;
-DINO features themselves, latents, voxel coordinates and meshes are **not averaged**.
-The server endpoint is `POST /generate-trellis2-mv`, and Trellis Studio exposes a
-separate **TRELLIS.2 · multiview** mode.
-
-The algorithm is experimental: equal multidiffusion averaging has known cases of
-width/thickness drift in upstream testing. Confidence-weighted fusion is tracked
-separately rather than silently changing the reference semantics. The exact pinned oracle
-and fixture protocol live in `docs/results/2026-09-21-trellis2-mv-reference.md`.
-
-### Pixal3D multiview mode
-
-`trellis-cli --views DIR out.glb --models MODELS_DIR --res 1024|1536 [--num-views N] [--seed N]`
-runs the Pixal3D camera-aware multiview cascade instead of single-image TRELLIS.2:
-
-```
-# assets/mv_images/example is the four-view sample in the TencentARC/Pixal3D repository
-trellis-cli --views path/to/Pixal3D/assets/mv_images/example \
-            --models pixal3d_models --seed 42 --res 1024 out.glb
-```
-
-`DIR` must contain `transforms.json` (Blender/NeRF convention: top-level `mesh_scale` and
-`camera_angle_x` fallback, `frames[]` each with `file_path`, a 4×4 row-major `transform_matrix`
-camera-to-world, and an optional per-frame `camera_angle_x`; frame 0 is the main/front view)
-plus every frame's RGBA image, each with a **real alpha channel already baked in** — this mode
-does no background matting, unlike the single-image path. `--num-views N` uses only the first
-`N` frames. `--views` is mutually exclusive with the positional/`--image` input, and `--res 512`
-is rejected: Pixal3D ships no res-512 texture flow, so the 1024/1536 cascade is mandatory.
-
-**Without `transforms.json`**, a directory holding **exactly four** turntable views works too, as
-long as you pass `--mesh-scale F` (a positive projection scale — no default is assumed, because a
-wrong scale silently corrupts the reconstruction). This is still the **multiview** cascade with the
-Pixal3D `*_mv.gguf` weights — it only removes the need to author camera JSON for the canonical
-turntable layout; it is not a single-view mode:
-
-```
-trellis-cli --views ./views --mesh-scale 1.0 --models pixal3d_models --seed 42 out.glb
-```
-
-The four images are sorted by filename in natural order (`view2` before `view10`; the exact rule is
-`natural_name_less` in `src/transforms_json.cpp`, mirrored by `natural_sort` in
-`install/generate.sh` and cross-checked by `install/test_natural_order.sh`) and taken as
-**front, right, back, left** — elevation 0, camera distance 3.119, FOV 20°, the same canonical rig
-the browser app synthesizes (`web/real_e2e/calibration.js`). Anything else — three or five images,
-a missing `--mesh-scale`, `--num-views` other than 4 — is rejected rather than guessed. A present
-but malformed `transforms.json` is still an error; the rig is used only when the file is absent.
-With `transforms.json` present, `--mesh-scale` overrides the value inside it.
-
-#### Preparing your own four views
-
-The four images must describe *one* object seen from the canonical rig, so what matters is not
-their source (photos, renders, or a drawn turnaround sheet) but that they agree with each other and
-with the camera contract:
-
-- **Alpha, not a matte step.** `--views` refuses a frame whose alpha is fully opaque. Matte the
-  images yourself and **keep the framing**: `transforms.json` describes the framing as given, so do
-  not re-crop to the object's bounding box afterwards (`--bg-only` does exactly that and is
-  therefore not usable to prepare multiview input).
-- **Scale and centring.** At the shipped rig (FOV 20°, camera distance 3.119) the `[-0.5, 0.5]³`
-  world cube covers ≈91 % of the frame, so size the object to ~85 % of the frame height, use the
-  *same* scale factor for all four views, and centre it. Pixal3D's own
-  `assets/mv_images/example` sits at ≈83 %.
-- **No camera JSON needed** for the canonical turntable: reuse that sample's `transforms.json`
-  verbatim (azimuths 0° / 90° / 180° / 270°, elevation 0°, FOV 20°) and point each `file_path` at
-  your own image, or drop the file and pass `--mesh-scale` as described above.
-- **Check the result instead of eyeballing it.** `python3 tools/silhouette_iou.py out.glb DIR
-  --res 256` reprojects the generated mesh through the input cameras and reports per-view
-  silhouette IoU plus the implied `mesh_scale`; a view that disagrees with its input shows up here
-  long before it is visible in a turntable render.
-
-#### Known multiview failure modes
-
-Measured on this fork against the official PyTorch `inference_mv.py` with identical inputs and
-seed, so these are properties of the Pixal3D model rather than of the port:
-
-- **Thin protruding parts get duplicated.** A figure whose single tail leaves the left hip and
-  points backwards reconstructs with *two* tails, one per side — already at `--num-views 2`
-  (front + 90°), with inputs that are mutually consistent, and the reference pipeline produces the
-  same two tails. Thin flat parts (an ear drawn as a sheet) also lose their inner shape at the
-  1024³ grid.
-- **A display base can grow into a floor.** Inputs where the subject stands on an explicit round
-  stand sometimes gain a hallucinated slab under it; the same input without a base does not. The
-  reference pipeline reproduces this too.
-- **Side views are the weak spot for characters.** Per-view silhouette IoU of an internally
-  consistent subject stays at 0.92–0.96 on all four views, while character turnarounds drop to
-  ~0.67–0.76 on the two side views with front/back still at ~0.92 — worth checking before blaming
-  the reconstruction.
-- **Cost follows the occupied volume, not the image.** A slim standing character takes ~1 000
-  active voxels at res 32 and ~4 400 HR tokens (≈270 s end-to-end on an RTX 4090 at res 1024),
-  where a stout subject of the same pixel size takes ~3 100 voxels / ~14 000 tokens (≈400 s).
-
-`--pixal3d-weights sv|mv` picks the flow-weight family (default `mv`). The official Pixal3D
-release has a single-view and a multiview checkpoint for each of the four flow stages; this repo
-names the converted single-view files with `_sv.gguf` and the multiview files with `_mv.gguf`.
-The same native loader/graph can read either family, while the five shared models are unchanged.
-`sv` is validated at V=1 and `mv` at V=4; other view counts are allowed with an explicit warning.
-This selector changes the checkpoint family only — with `--views` the input still uses the camera
-contract (a one-frame `transforms.json`); `--sv-image` below synthesizes that frame for you.
-
-**Single-view input without a `transforms.json` (0.10.0):** `--sv-image IMAGE.png` takes one
-pre-matted RGBA image, crops it the way the reference preprocess does (alpha bbox, 1.1× square,
-transparent padding) and synthesizes the front gauge camera (`mesh_scale` 1.0, FOV `--fov RAD`,
-default 20°) in the shared C++ — no separate camera-estimation wrapper is needed. It forces
-`--pixal3d-weights sv`, and the staged `input.png` + `transforms.json` are kept next to the output
-so the run can be replayed as a normal `--views` input. `trellis-server` exposes the same path as
-`POST /generate-sv`, and Trellis Studio has a **Pixal3D single view** mode.
-
-```bash
-./build/trellis-cli --sv-image belle_front.png --fov 0.3490658503988659 \
-                    --models /path/to/pixal3d-sv-q8_0-v1 --seed 42 --res 1024 out.glb
-```
-
-**SV distribution status (0.10.0):** the SV set is a *second* model directory, never merged into
-the MV one — `pixal3d-sv-q8_0 v1` and `pixal3d-f16 v1` / `pixal3d-q8_0 v1` share five file names
-with different bytes. `install.sh --model-manifest-sv … --model-base-url-sv …` installs and
-verifies it into `<dest>/models-sv` and writes `modelsDirSv` for Studio; `trellis-server
---models-sv DIR` serves it and reports both sets in `GET /capabilities`. To build the SV files
-from a source checkout instead, start from an upstream TencentARC/Pixal3D snapshot that contains
-the plain (non-`_mv`) safetensors/config files under `ckpts/`, then convert the four flows into a
-directory that also contains the shared Pixal3D models:
-
-```bash
-export TRELLIS_MODELS=/path/to/TencentARC/Pixal3D
-export TRELLIS_GGUF_OUT=/path/to/pixal3d_models
-python3 tools/convert.py \
-  pixal3d_ss_flow_sv \
-  pixal3d_shape_flow_512_sv \
-  pixal3d_shape_flow_1024_sv \
-  pixal3d_tex_flow_1024_sv
-```
-
-That creates `pixal3d_ss_flow_sv.gguf`, `pixal3d_shape_flow_512_sv.gguf`,
-`pixal3d_shape_flow_1024_sv.gguf`, and `pixal3d_tex_flow_1024_sv.gguf`. The existing
-`dinov3.gguf`, `pixal3d_naf.gguf`, `ss_dec.gguf`, `shape_dec.gguf`, and `tex_dec.gguf` are shared
-between SV and MV. A follow-up model-set release can add verified size/SHA manifests and installer
-selection without changing the runtime selector introduced here.
-
-For the currently published MV set, `--models DIR` needs `dinov3.gguf`, `pixal3d_naf.gguf`,
-`pixal3d_ss_flow_mv.gguf`, `pixal3d_shape_flow_512_mv.gguf`,
-`pixal3d_shape_flow_1024_mv.gguf`, `pixal3d_tex_flow_1024_mv.gguf`, `ss_dec.gguf`,
-`shape_dec.gguf`, `tex_dec.gguf`. Per-view DINOv3 features are pixel-aligned-projected into a
-shared 3D grid (`ProjGrid`) and averaged over views (`ProjectAttention`); the shape/texture stages
-additionally fuse in NAF high-resolution image features. See `docs/spec/30-pixal3d-cond.md` for
-the full conditioning spec. Face budget (1M), UV atlas (4096px) and remesh band (1) default to the
-reference pipeline's own values in this mode (override with `--decim`/`--atlas`/`--band` as usual);
-everything after SLAT sampling (decode/remesh/decimate/UV/bake/GLB export) is the same TRELLIS.2
-postprocess code.
-
-## Pipeline
-
-```
-text prompt
-  │  stable-diffusion.cpp (Z-Image)              [external binary]
-  ▼
-RGB image
-  │  BiRefNet / RMBG  (background removal)        [GGML]   → RGBA cutout
-  ▼
-DINOv3 ViT-L/16 feature extractor                [GGML]   → patch tokens [N,1024]
-  │  (image conditioning, + null cond for CFG)
-  ▼
-① Sparse-Structure flow DiT (1.3B, dense 16³)    [GGML]
-  │  → 8-ch 16³ latent → SS conv3d decoder → 64³ occupancy → active voxels
-  ▼
-② Shape-SLAT flow DiT (1.3B, sparse)             [GGML]   → 32-ch latent / active voxel
-  │  → FlexiDualGrid shape decoder (sparse ConvNeXt) → dual grid → FlexiCubes mesh
-  ▼
-③ Texture-SLAT flow DiT (1.3B, sparse)           [GGML]   → 32-ch latent / active voxel
-  │  → Sparse U-Net tex decoder (6-ch PBR per voxel)
-  ▼
-textured mesh
-  │  weld → fill → narrow-band DC remesh → QEM edge-collapse decimate → cluster + xatlas →
-  │  trilinear PBR bake (BVH snap) → Telea inpaint    [decimate: CPU / CUDA / HIP / Vulkan]
-  ▼
-UV-textured GLB (WebP PBR textures)
-```
-
-The decimation is a faithful port of the reference's CuMesh QEM edge-collapse simplifier
-(Garland-Heckbert quadrics + a skinny-triangle shape metric + flip rejection + boundary
-weighting), replacing an off-the-shelf simplifier that produced a fragmented, non-adaptive
-mesh. The result matches the reference's adaptive triangulation — a single watertight
-component with reference-level surface smoothness. It runs on the GPU (CUDA, ROCm/HIP, or a
-Vulkan compute shader) behind one dispatch, with an automatic CPU fallback.
-
-All three flow stages use a `FlowEulerGuidanceIntervalSampler` (rectified-flow Euler,
-12 steps, classifier-free guidance with a guidance interval + rescale). Optional
-512→1024 cascade for higher resolution.
-
-The 1024 cascade runs on a 16 GB card thanks to **FlashAttention with padded K/V**
-(`src/dit.cpp::sdpa`): the manual softmax needed a single ~18 GB score-matrix alloc at
-the sparse-structure stage, and at the HR token count (≈53k) ggml's tiled FA NaN'd on
-the unpadded last key-tile — zero-padding K/V to a 256 multiple + BF16 fixes both.
-f16 compute is the default and matches torch (`--f32` forces f32; `--no-fa` restores
-the plain-softmax path for A/B testing).
-
-Every neural component is validated against PyTorch (the `trellis-test-*` binaries +
-`tools/ref_*.py`): SS sampler matches torch to rel 4.3e-3 (exact voxel match), DiT
-2.8e-3, DINOv3 1.8e-2, sparse conv 1e-3, BiRefNet 4e-4, C2S exact.
-
-## Models
-
-**Pre-built GGUFs:** [`ilintar/trellis2-gguf`](https://huggingface.co/ilintar/trellis2-gguf) —
-download the full set and point `trellis-cli` / `trellis-server` (`--models DIR`) at that
-folder. Or convert your own from the source checkpoints below (see `docs/spec/` and
-`tools/` for the safetensors→GGUF conversion).
-
-| role | source | notes |
-|------|--------|-------|
-| SS flow DiT | `microsoft/TRELLIS.2-4B` `ss_flow_img_dit_1_3B_64` | 1.3B, bf16 |
-| Shape SLAT flow | `…/slat_flow_img2shape_dit_1_3B_{512,1024}` | 1.3B, bf16; `_1024` drives the cascade's HR pass |
-| Tex SLAT flow | `…/slat_flow_imgshape2tex_dit_1_3B_{512,1024}` | 1.3B, bf16; `_1024` drives the cascade's HR pass |
-| Shape decoder | `…/shape_dec_next_dc_f16c32` | FlexiDualGrid VAE |
-| Tex decoder | `…/tex_dec_next_dc_f16c32` | Sparse U-Net VAE, 6-ch |
-| SS decoder | `microsoft/TRELLIS-image-large` `ss_dec_conv3d_16l8` | reused from v1 |
-| Image cond | `timm/vit_large_patch16_dinov3.lvd1689m` | ungated mirror of DINOv3 ViT-L (same weights) |
-| BG removal | `ZhengPeng7/BiRefNet` | ungated BiRefNet (RMBG-2.0 substitute) |
-
-The two helper models are HF-gated upstream; the ungated equivalents above avoid needing
-a token.
-
-## Performance
-
-Measured end-to-end (image → GLB, res 1024, 12-step flows, includes model load;
-`docs/spec/29-perf-profile.md` has the per-flow breakdown and methodology):
-
-| input class | Strix Halo iGPU (Vulkan) | RTX 5060 Ti (CUDA) | reference Python, same GPU (cold) |
+| mode | Vulkan, default | Vulkan, `--no-fa` | ROCm, default |
 |---|---|---|---|
-| light (goblin, 17k HR tokens) | 6:09 | **3:16** | 3:37 |
-| heavy (turret, ~45k HR tokens) | 12:39 | **7:23** | 5:20 |
+| TRELLIS.2, one image | works | not needed | works |
+| Pixal3D single view | fails: "no voxels produced" | works | works |
+| Pixal3D multiview | fails: "no voxels produced" | runs, but the mesh is unrecognizable | works |
 
-The postprocess (weld → remesh → decimate → unwrap → bake → WebP) uses the faithful
-CuMesh QEM decimation described above. With a GPU backend it decimates a 5.4M→300k-face
-mesh in ~5 s on ROCm (gfx1151) — ~18× the single-threaded CPU path — matching the
-reference's on-GPU decimation; the CPU fallback stays available for GPU-less builds.
-On Strix Halo, Vulkan is the fastest backend: ROCm requires
-`GGML_CUDA_DISABLE_GRAPHS=1` (ggml's HIP graph capture stalls on these graphs)
-and still trails Vulkan by 10–40 %.
+Measured on the Pixal3D multiview sample (seed 1), against the project's reference run on Apple
+Metal:
 
-**Apple Silicon (Metal):** verified end-to-end on an Apple M5 (24 GB unified):
-res-512 image → textured GLB in **9:21** with a **5.6 GB** peak RSS, all
-neural stages on Metal (2.4M decoded voxels, 4.8M-face raw mesh). bfloat16 and
-f16 tensor APIs are available from M2 on; on M1 use `TRELLIS_FA_FAST=1`
-(f16 K/V) since the default FlashAttention path casts K/V to bf16.
+| stage | reference | ROCm | Vulkan `--no-fa` |
+|---|---|---|---|
+| structure voxels | 4438 | 4437 | 4338 |
+| HR shape latent, std | 5.25 | 5.30 | **3077** |
+| decoded voxels | 4.71 M | 4.73 M | **1.20 M** |
+| silhouette IoU vs inputs | 0.979 | 0.981 | **0.20** |
 
-## Tools
+### Why
 
-| tool | purpose |
-|------|---------|
-| `post-replay <dump.bin> <out.glb>` | re-run the whole postprocess from a `TRELLIS_DUMP_POST` dump in seconds (flags: `--no-remesh`, `--band`, `--no-snap`, `--box-uv`, `--faces`, `--atlas`, …) |
-| `tools/glb_metrics.py` | CPU geometry/UV/material metrics (components, boundary edges, winding, texel density, doubleSided/WebP flags) for ours-vs-reference GLB comparison |
-| `tools/render_glb.py` / `render_glb_fast.py` | quick multi-view flat renders |
-| `tools/mv_preview/` | PBR-correct GLB previews via the `<model-viewer>` web component (see its README) |
+Attention, the core operation of these transformer models, has two code paths in this program:
 
-## Building
+1. **FlashAttention (the default).** With a padding mask, it gives wrong results on Vulkan in
+   one specific place: Pixal3D's cross-attention over its five "global" image tokens. The first
+   stage then finds no voxels, and the run stops with "no voxels produced". TRELLIS.2 doesn't
+   use that attention shape, so it is unaffected.
+2. **Plain attention (`--no-fa`).** This one breaks at large token counts. In the multiview
+   high-resolution stage (about 17,500 tokens) the shape latent blows up and the mesh comes out
+   as garbage. Single view uses far fewer tokens and survives.
 
-GGML is vendored in `thirdparty/ggml`. Pick a backend:
+### Is it the driver or the program?
 
-```
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON   # Vulkan
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON    # CUDA
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_HIP=ON     # ROCm
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release                   # macOS: Metal (auto)
-cmake --build build -j
-```
+Neither the model code nor the pipeline is at fault. The identical computation graph gives
+correct results on the CPU backend and on ROCm on the same GPU. The project also records it as
+correct on CUDA, Metal and NVIDIA Vulkan. The fault sits in the Vulkan layer underneath, either
+in ggml's Vulkan kernels (the copy in `thirdparty/ggml`, commit `737e88f2` from 2026-08-19) or
+in how the RADV driver compiles and runs them. These tests couldn't tell which:
 
-On **macOS/Apple Silicon** no backend flag is needed — ggml's Metal backend
-defaults ON for Apple builds and the generic device selection picks the GPU.
-The two custom kernels (BiRefNet deformable conv, QEM decimation) run their
-CPU fallbacks there.
+- **Kernel switches change the outcome.** `GGML_VK_DISABLE_COOPMAT=1` (no matrix cores) or
+  `GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1` fixes the "no voxels" bug in the first stage.
+  `GGML_VK_DISABLE_F16`, `_FUSION` and `_GRAPH_OPTIMIZE` don't. So one specific kernel path
+  misbehaves on this card.
+- **No single Vulkan setting fixes everything.** With `GGML_VK_DISABLE_COOPMAT=1`, multiview
+  gets past the first stage but then aborts later with non-finite values.
+- **No driver update was available.** In November 2026, Fedora 43 had no Mesa newer than 25.3.6,
+  not even in `updates-testing`. A newer Mesa, or a newer ggml, may fix it. If you try one, use
+  the checks below to see whether it did.
 
-See `.github/workflows/release.yml` for the exact flags the release binaries use
-(GPU target lists, `-DGGML_OPENMP=OFF` on Windows). Releases also include a
-`cuda12` variant built with CUDA 12.9 for Pascal/Volta GPUs (compute capability
-6.0/6.1/7.0); the standalone installers select it automatically for devices such
-as the Tesla P100, and `install.sh` also selects it on **WSL2** when the user-mode
-CUDA driver reported by `nvidia-smi` is older than the R590 branch the CUDA 13.1
-runtime corresponds to (#35).
+### If you must use Vulkan
 
-## Layout
+- **TRELLIS.2:** works as is.
+- **Pixal3D single view:** add `--no-fa`.
+- **Pixal3D multiview:** `TRELLIS_FA_NOMASK=1 ./build/trellis-cli --views …` keeps
+  FlashAttention but drops its padding mask. That is a debug switch, not an official option. On
+  the sample it scored IoU 0.978 (reference 0.979), and it took 8:46 against 5:39 on ROCm.
 
-```
-src/            C++ implementation (models, ops, pipeline, drivers)
-src/test_*.cpp  parity / unit tests vs reference tensors (built as the trellis-test-* binaries)
-include/        public headers
-tools/          python conversion scripts (safetensors → GGUF) + reference-dump checks, via the uv venv
-docs/spec/      reverse-engineered per-component architecture spec
-thirdparty/     vendored ggml (gitignored), plus stb + xatlas
-```
+### Checking whether a run is healthy
+
+- **The log:** the line starting `[stats] HR slat` should show `std=` around 5. Broken runs
+  show thousands.
+- **The finished mesh:** run `tools/silhouette_iou.py` on it (see 5.4).
+
+## The "inner shell" in the meshes
+
+Output meshes have a second, inward-facing wall just inside the outer surface. It looks as if
+Blender's Solidify modifier had been applied. This is not a bug. The final remesh step builds
+the surface from an *unsigned* distance field, the same way the reference TRELLIS.2
+postprocess does. It places a surface a small distance on both sides of the model's thin shell,
+which gives an outer skin plus an inner skin about one voxel inside it. Hunyuan3D 2.0 doesn't
+have this because it uses a signed field with marching cubes.
+
+To strip the inner wall in **MeshLab** (generate with `--webp off`, since MeshLab can't read
+WebP textures):
+
+1. **File → Import Mesh**, pick the `.glb`.
+2. **Filters → Quality Measure and Computations → Compute Ambient occlusion**, Rays = 128.
+3. **Filters → Selection → Select by Face Quality**: Min 0, Max 0, Inclusive on. This selects
+   the faces no ray can escape from.
+4. **Filters → Selection → Delete Selected Faces and Vertices**.
+5. **Filters → Cleaning and Repairing → Remove Isolated pieces (wrt Face Num.)**, size 100.
+6. **File → Export Mesh As → OBJ**, with texture saving off. Copy `<name>_base.png` next to
+   the OBJ and change `map_Kd texture_0` in the `.mtl` to that file name.
+
+On the goblin this kept the whole outer surface and dropped about two-thirds of the faces.
+Limitations:
+
+- **No GLB export:** MeshLab can't write GLB. For a GLB, import the OBJ into Blender and export
+  from there.
+- **Open edges:** the mesh is no longer closed where the inner wall met openings.
+- **Partly visible wall stays:** inner wall that can be seen through an opening gets some light,
+  so it isn't removed.
+
+## Credits and license
+
+- **Code:** MIT. © 2026 Piotr Wilkin (trellis.cpp) and raven (pixal3d.cpp changes). See
+  [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE) for all third-party attributions.
+- **Models:** Microsoft [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) and TencentARC
+  [Pixal3D](https://github.com/TencentARC/Pixal3D), each under its own license.

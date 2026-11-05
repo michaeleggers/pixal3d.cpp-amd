@@ -181,6 +181,6 @@ focused. Commit subjects are concise/imperative with scoped prefixes (`fix:`, `f
 model weights, and reference dumps — keep those and machine-specific config out of commits/PRs.
 
 `TRELLIS_DBG_*` env vars are debug-logging toggles only; there are otherwise no
-behavior-driving env vars beyond the flags documented in `README.md` (`--res`, `--bg-removal`,
+behavior-driving env vars beyond the flags documented in `README.upstream.md` (`--res`, `--bg-removal`,
 `--no-texture`, `--decim`, `--atlas`, `--box-uv`, `--seed`, `--require-gpu`, `--f32`, `--no-fa`) —
 prefer flags over new env vars for anything that changes pipeline behavior.
